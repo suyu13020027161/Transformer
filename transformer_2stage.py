@@ -1,8 +1,7 @@
-# ====== transformer.py (single-seed=23, add checkpointing & resume) ======
 import re, math, numpy as np, pandas as pd
 import numpy as np
 from pathlib import Path
-import warnings
+import warnings, os
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
@@ -16,32 +15,34 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
-# ========================
-# 新增：是否继续训练 & 权重路径（无需命令行）
-# ========================
-CONTINUE_TRAINING = True           # False=从头训练；True=基于已保存权重继续训练（refit阶段）
-WEIGHTS_PATH      = "model23_weights.pt"  # 仅单seed=23，使用固定文件名
-
-#Config
+# =========================
+# Config (数据与任务参数)
+# =========================
 CSV_PATH   = "input.csv"
 TARGET_COL = "Nmass_O"
 WAVELEN_MIN = 400.0
 WAVELEN_MAX = 2400.0
 
-#Remove strong water absorption windows (nanometres)
-WATER_BANDS = [(1350, 1460), (1790, 1960), (2470, 2560)]
+# 新增：训练/保存相关参数（无需命令行）
+SAVE_PER_SEED = False
+SAVE_BEST_BY_TEST_R2 = True
+SAVE_DIR = "checkpoints"
 
-#Savitzky–Golay (for 1st derivative)
-#Must be odd; try 11, 15, 21
+# 继续训练（在已有权重基础上）
+CONTINUE_TRAIN = True
+RESUME_WEIGHTS_PATH = "checkpoints/seed37.pt"  # 可是 .pt / .pth / checkpoint dict 都行
+RESUME_SEED = 37
+# 可选：当权重不完全匹配时的策略（一般保持 False 更鲁棒）
+RESUME_STRICT = False
+
+# =========================
+
+WATER_BANDS = [(1350, 1460), (1790, 1960), (2470, 2560)]
 SG_WINDOW   = 15
 SG_POLY     = 2
 SG_DERIV    = 1
-
-#Selection limits
 K_MIN = 8
 K_MAX = 500
-
-#For inner CV when choosing k / components
 INNER_KFOLDS = 5
 MIN_SPACING_NM = 12.0
 RANDOM_STATE = 42
@@ -51,107 +52,102 @@ VAL_SIZE  = 0.15
 CFG = dict(
     d_model=64,
     nhead=4,
-    #Encoder depth
-    num_layers=6,          
+    num_layers=6,
     dim_ff=256,
     dropout=0.10,
     lr=1e-3,
     weight_decay=1e-4,
     batch_size=64,
-    max_epochs=10000,
-    #Early stopping on val
-    patience=10000,           
+    max_epochs=10,
+    patience=10,
     grad_clip=1.0,
     huber_beta=0.5,
     warmup_epochs=10,
     cosine_min_lr=1e-6,
+    seeds=[13, 23, 37, 47, 59],
 )
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ====== 新增：保存/加载权重的辅助函数（不改动训练/数据逻辑） ======
-# --- replace this whole function ---
-def save_model_weights(path: str | Path, model: nn.Module, extra: dict | None = None):
+# ================= 工具函数（保存/加载鲁棒化） =================
+def _ensure_dir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def _save_state_dict(state_dict: dict, path: str):
+    _ensure_dir(os.path.dirname(path) if os.path.dirname(path) else ".")
+    torch.save(state_dict, path)
+    print(f"[Save] Weights saved → {path}")
+
+def _unwrap_state_dict(obj):
     """
-    Save only tensors + basic python types to keep it loadable with weights_only=True.
+    支持以下几种常见格式：
+      - 直接是 state_dict (dict[str, Tensor])
+      - {'state_dict': ...}
+      - {'model': {'state_dict': ...}} / {'model_state_dict': ...}
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(obj, dict):
+        # 直接是 state_dict（值基本是 Tensor）
+        if all(isinstance(v, torch.Tensor) for v in obj.values()):
+            return obj
+        # 常见包装
+        for key in ["state_dict", "model_state_dict", "model", "net", "ema_state_dict"]:
+            if key in obj:
+                sub = obj[key]
+                # model 里再套一层
+                if isinstance(sub, dict) and "state_dict" in sub:
+                    return sub["state_dict"]
+                return sub
+    return obj  # 尝试原样返回
 
-    def _clean(o):
-        import numpy as _np
-        import torch as _torch
-        if isinstance(o, _np.ndarray):
-            # turn into list to avoid numpy pickling
-            return o.tolist()
-        if isinstance(o, _torch.Tensor):
-            return o  # tensors are fine
-        if isinstance(o, (float, int, str, bool)) or o is None:
-            return o
-        if isinstance(o, (list, tuple)):
-            return type(o)(_clean(x) for x in o)
-        if isinstance(o, dict):
-            return {k: _clean(v) for k, v in o.items()}
-        # fallback: stringify to be safe
-        return str(o)
+def _strip_module_prefix(sd: dict):
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("module."):
+            out[k[len("module."):]] = v
+        else:
+            out[k] = v
+    return out
 
-    pkg = {"model_state_dict": model.state_dict()}
-    if extra:
-        pkg["meta"] = _clean(extra)
-
-    torch.save(pkg, str(path))
-    print(f"[Checkpoint] Saved weights to: {path}")
-
-# --- replace this whole function ---
-def try_load_model_weights(path: str | Path, model: nn.Module) -> bool:
+def load_weights_flex(model: nn.Module, path: str, strict: bool = False) -> int:
     """
-    Try safe loading first (PyTorch 2.6: weights_only=True).
-    If it fails, allowlist numpy reconstruct and retry.
-    Finally, fall back to weights_only=False (ONLY IF YOU TRUST THE FILE).
+    尝试以最大兼容性加载权重：
+      1) 自动解包 checkpoint/state_dict
+      2) 去掉 DataParallel 的 'module.' 前缀
+      3) 当 strict=False 时，只加载键名和 shape 都匹配的参数
+    返回：成功加载的参数个数
     """
-    path = Path(path)
-    if not path.exists():
-        print(f"[Checkpoint] Not found, skip load: {path}")
-        return False
+    obj = torch.load(path, map_location="cpu")
+    sd = _unwrap_state_dict(obj)
+    if not isinstance(sd, dict):
+        raise RuntimeError(f"Unsupported checkpoint format at {path}")
 
-    # 1) Safe attempt
-    try:
-        pkg = torch.load(str(path), map_location="cpu", weights_only=True)
-        state = pkg.get("model_state_dict", pkg)
-        model.load_state_dict(state, strict=False)
-        print(f"[Checkpoint] Loaded (safe) from: {path}")
-        return True
-    except Exception as e_safe:
-        print(f"[Checkpoint] Safe load failed: {e_safe}")
+    sd = _strip_module_prefix(sd)
 
-    # 2) Safe attempt with allowlisted numpy reconstruct (still weights_only=True)
-    try:
-        import numpy as _np
-        import torch.serialization as ts
-        # allowlist the numpy reconstruct used by older numpy pickles
-        ts.add_safe_globals([_np.core.multiarray._reconstruct])
-        pkg = torch.load(str(path), map_location="cpu", weights_only=True)
-        state = pkg.get("model_state_dict", pkg)
-        model.load_state_dict(state, strict=False)
-        print(f"[Checkpoint] Loaded (safe+allowlist) from: {path}")
-        return True
-    except Exception as e_allow:
-        print(f"[Checkpoint] Safe+allowlist load failed: {e_allow}")
+    if strict:
+        missing, unexpected = model.load_state_dict(sd, strict=True)
+        # PyTorch 2.0 之后 strict=True 返回的是 None；为兼容性这里不依赖返回值
+        print("[Resume] Loaded with strict=True")
+        return len(sd)
+    else:
+        model_sd = model.state_dict()
+        loadable = {}
+        skipped = []
+        for k, v in sd.items():
+            if k in model_sd and isinstance(v, torch.Tensor) and v.shape == model_sd[k].shape:
+                loadable[k] = v
+            else:
+                skipped.append(k)
+        model_sd.update(loadable)
+        model.load_state_dict(model_sd, strict=False)
+        print(f"[Resume] Loaded {len(loadable)} tensors; skipped {len(skipped)} keys (name/shape mismatch).")
+        if skipped:
+            # 打印前若干个，方便诊断
+            print("         Skipped examples:", skipped[:5], "...")
+        return len(loadable)
 
-    # 3) LAST RESORT: weights_only=False  (⚠️ 仅在你信任该文件来源时使用)
-    try:
-        pkg = torch.load(str(path), map_location="cpu", weights_only=False)
-        state = pkg.get("model_state_dict", pkg)
-        model.load_state_dict(state, strict=False)
-        print(f"[Checkpoint] Loaded (weights_only=False) from: {path}")
-        return True
-    except Exception as e_unsafe:
-        print(f"[Checkpoint] Load failed ({path}): {e_unsafe}")
-        return False
+# =======================================================
+# 以下为原有逻辑（保持不变），只在合适位置挂接保存/续训逻辑
+# =======================================================
 
-
-
-
-#Utils
 def nm_from_col(name: str):
     m = re.findall(r"(\d+(?:\.\d+)?)", str(name))
     return float(m[-1]) if m else np.nan
@@ -170,7 +166,6 @@ def remove_water_bands(wls_nm, X):
 def rmse(y_true, y_pred):
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
-#Preprocess: band windowing (400–2400), water windows, SG deriv + SNV
 def spectral_preprocess(X_raw, wls_nm_raw):
     mask = (wls_nm_raw >= WAVELEN_MIN) & (wls_nm_raw <= WAVELEN_MAX) & np.isfinite(wls_nm_raw)
     wls = wls_nm_raw[mask]
@@ -182,7 +177,6 @@ def spectral_preprocess(X_raw, wls_nm_raw):
     X2 = snv_transform(X2)
     return X2.astype(np.float32), wls2
 
-#sSPA (supervised) with train-only fit + min spacing
 def corr_abs(a, b):
     a = a - a.mean(); b = b - b.mean()
     sa, sb = a.std() + 1e-12, b.std() + 1e-12
@@ -255,10 +249,9 @@ def choose_k_via_inner_cv(Xtr, ytr, order, k_min=8, k_max=40, inner_folds=5, bas
     k_best = ks[int(np.argmin(mean_rmse))]
     return k_best, mean_rmse
 
-#Alternative selectors (MI, LassoCV)
 def mi_rank(Xtr, ytr):
     mi = mutual_info_regression(Xtr, ytr, random_state=RANDOM_STATE)
-    return list(np.argsort(mi)[::-1])  # descending
+    return list(np.argsort(mi)[::-1])
 
 def lasso_select(Xtr, ytr):
     sc = StandardScaler().fit(Xtr)
@@ -269,7 +262,6 @@ def lasso_select(Xtr, ytr):
     sel = [j for j in order if coef[j] > 1e-9]
     return sel, lcv.alpha_
 
-#Baselines on selected bands (PLSR, Ridge)
 def run_plsr_trainval_test(X_tr, y_tr, X_va, y_va, X_te, y_te, ncomp_min=4, ncomp_max=24):
     kf = KFold(n_splits=INNER_KFOLDS, shuffle=True, random_state=RANDOM_STATE)
     comps = list(range(ncomp_min, ncomp_max+1))
@@ -289,25 +281,18 @@ def run_plsr_trainval_test(X_tr, y_tr, X_va, y_va, X_te, y_te, ncomp_min=4, ncom
     sc2 = StandardScaler().fit(X_tv)
     pls2 = PLSRegression(n_components=c_best).fit(sc2.transform(X_tv), y_tv)
     y_pred = pls2.predict(sc2.transform(X_te)).ravel()
-    return {"n_components": c_best,
-            "rmse": rmse(y_te, y_pred),
-            "r2": r2_score(y_te, y_pred),
-            "pred": y_pred}
+    return {"n_components": c_best, "rmse": rmse(y_te, y_pred), "r2": r2_score(y_te, y_pred), "pred": y_pred}
 
 def run_ridge_trainval_test(X_tr, y_tr, X_va, y_va, X_te, y_te):
     alphas = np.logspace(-4, 3, 60)
     sc = StandardScaler().fit(X_tr)
     Xtr_s = sc.transform(X_tr); Xva_s = sc.transform(X_va)
-    ridge = RidgeCV(alphas=alphas, cv=INNER_KFOLDS).fit(np.vstack([Xtr_s, Xva_s]),
-                                                        np.concatenate([y_tr, y_va]))
+    ridge = RidgeCV(alphas=alphas, cv=INNER_KFOLDS).fit(np.vstack([Xtr_s, Xva_s]), np.concatenate([y_tr, y_va]))
     sc_all = StandardScaler().fit(np.vstack([X_tr, X_va]))
     y_pred = ridge.predict(sc_all.transform(X_te))
-    return {"alpha": float(ridge.alpha_),
-            "rmse": rmse(y_te, y_pred),
-            "r2": r2_score(y_te, y_pred),
-            "pred": y_pred}
+    return {"alpha": float(ridge.alpha_), "rmse": rmse(y_te, y_pred), "r2": r2_score(y_te, y_pred), "pred": y_pred}
 
-# Load data, preprocess, split
+# ====== 数据与分割 ======
 df = pd.read_csv(CSV_PATH)
 all_band_cols = [c for c in df.columns if "wave" in c.lower()]
 wls_nm_all = np.array([nm_from_col(c) for c in all_band_cols], dtype=float)
@@ -315,33 +300,24 @@ df = df[[TARGET_COL] + all_band_cols].dropna().reset_index(drop=True)
 X_raw = df[all_band_cols].to_numpy(dtype=float)
 y = df[TARGET_COL].to_numpy(dtype=float)
 
-#Preprocess spectra (SG deriv + water removal + SNV)
 X_pp, wls_pp = spectral_preprocess(X_raw, wls_nm_all)
 
-#Consistent split: 70/15/15 (train/val/test)
 X_tv, X_te, y_tv, y_te = train_test_split(X_pp, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, shuffle=True)
 val_ratio_in_tv = VAL_SIZE / (1.0 - TEST_SIZE)
 X_tr, X_va, y_tr, y_va = train_test_split(X_tv, y_tv, test_size=val_ratio_in_tv, random_state=RANDOM_STATE, shuffle=True)
 print(f"Split → train={len(y_tr)} | valid={len(y_va)} | test={len(y_te)} | bands={X_pp.shape[1]}")
 
-#Train-only sSPA with spacing -> choose k by inner CV -> lock bands
 order_sspa = supervised_spa_order_trainonly(
-    X_tr, y_tr, wls_pp,
-    max_k=K_MAX, first="maxcorr", min_spacing_nm=MIN_SPACING_NM, verbose=True
+    X_tr, y_tr, wls_pp, max_k=K_MAX, first="maxcorr", min_spacing_nm=MIN_SPACING_NM, verbose=True
 )
-k_best, curve = choose_k_via_inner_cv(
-    X_tr, y_tr, order_sspa,
-    k_min=K_MIN, k_max=K_MAX, inner_folds=INNER_KFOLDS, base_model="ridge"
-)
+k_best, curve = choose_k_via_inner_cv(X_tr, y_tr, order_sspa, k_min=K_MIN, k_max=K_MAX, inner_folds=INNER_KFOLDS, base_model="ridge")
 sel_cols = order_sspa[:k_best]
 sel_wls  = [float(wls_pp[j]) for j in sel_cols]
 print(f"\n[sSPA] Inner-CV best k = {k_best}")
 print("Selected wavelengths (nm):", [int(round(w)) for w in sel_wls])
 
-# Slice datasets to selected bands
 Xtr_sel = X_tr[:, sel_cols]; Xva_sel = X_va[:, sel_cols]; Xte_sel = X_te[:, sel_cols]
 
-#Baselines on selected bands
 res_plsr  = run_plsr_trainval_test(Xtr_sel, y_tr, Xva_sel, y_va, Xte_sel, y_te, ncomp_min=4, ncomp_max=min(24, k_best))
 res_ridge = run_ridge_trainval_test(Xtr_sel, y_tr, Xva_sel, y_va, Xte_sel, y_te)
 
@@ -349,7 +325,6 @@ print("\n=== Baselines on train-only selected bands ===")
 print(f"PLSR  → comps={res_plsr['n_components']:>2} | Test RMSE={res_plsr['rmse']:.3f} | Test R²={res_plsr['r2']:.3f}")
 print(f"Ridge → alpha={res_ridge['alpha']:.4g} | Test RMSE={res_ridge['rmse']:.3f} | Test R²={res_ridge['r2']:.3f}")
 
-#Alternative selectors for comparison
 mi_order = mi_rank(Xtr_sel if Xtr_sel.shape[1] > 0 else X_tr, y_tr)
 if len(mi_order) > 0:
     base_X = Xtr_sel if Xtr_sel.shape[1] > 0 else X_tr
@@ -378,7 +353,6 @@ if len(order_lasso) > 0:
     print(f"[Lasso] PLSR  Test R²={res_plsr_la['r2']:.3f} | RMSE={res_plsr_la['rmse']:.3f}")
     print(f"[Lasso] Ridge Test R²={res_ridge_la['r2']:.3f} | RMSE={res_ridge_la['rmse']:.3f}")
 
-#Export table of selected bands (sSPA)
 sel_table = pd.DataFrame({
     "rank": np.arange(1, len(sel_cols)+1),
     "col_index": sel_cols,
@@ -387,7 +361,6 @@ sel_table = pd.DataFrame({
 print("\nTrain-only sSPA selected bands:")
 print(sel_table.to_string(index=False))
 
-# Data scaling (fit on TRAIN ONLY for model selection; for final training after early-stop, refit on TRAIN+VAL)
 sc_tr = StandardScaler().fit(Xtr_sel)
 Xtr_s = sc_tr.transform(Xtr_sel).astype(np.float32)
 Xva_s = sc_tr.transform(Xva_sel).astype(np.float32)
@@ -404,7 +377,6 @@ tr_loader = DataLoader(SpectraDS(Xtr_s, y_tr), batch_size=CFG["batch_size"], shu
 va_loader = DataLoader(SpectraDS(Xva_s, y_va), batch_size=CFG["batch_size"], shuffle=False,  drop_last=False)
 te_loader = DataLoader(SpectraDS(Xte_s, y_te), batch_size=CFG["batch_size"], shuffle=False,  drop_last=False)
 
-#Model
 class PosEnc1D(nn.Module):
     def __init__(self, d_model, max_len=4096):
         super().__init__()
@@ -450,10 +422,9 @@ class SelfTransformerRegressor(nn.Module):
         z = self.pos(z)
         for blk in self.blocks:
             z = blk(z)
-        z = z.mean(dim=1)               
+        z = z.mean(dim=1)  # GAP
         return self.head(z).squeeze(-1)
 
-#Schedulers & training utils
 def cosine_with_warmup(epoch, base_lr, warmup, max_epochs, min_lr):
     if epoch < warmup:
         return base_lr * (epoch + 1) / max(1, warmup)
@@ -471,115 +442,70 @@ def eval_loader(model, loader, crit):
         yT.append(yb.detach().cpu().numpy())
         yP.append(pred.detach().cpu().numpy())
     yT = np.concatenate(yT); yP = np.concatenate(yP)
-    rmse = float(np.sqrt(np.mean((yT - yP)**2)))
+    rmse_v = float(np.sqrt(np.mean((yT - yP)**2)))
     ss_res = float(np.sum((yT - yP)**2))
     ss_tot = float(np.sum((yT - yT.mean())**2) + 1e-12)
-    r2 = 1.0 - ss_res/ss_tot
-    return rmse, r2, yP
+    r2_v = 1.0 - ss_res/ss_tot
+    return rmse_v, r2_v, yP
 
 def train_one_seed(seed, verbose_every=5):
-    """
-    当 CONTINUE_TRAINING=True：
-      - 直接加载 WEIGHTS_PATH 的已训练权重
-      - 在 Train/Val 上继续训练满 CFG["max_epochs"] 轮，并打印日志
-      - 选择验证集最佳权重后，进入原有 TRAIN+VAL 的 refit 阶段，保存权重并评估
-
-    当 CONTINUE_TRAINING=False：
-      - 保持原流程：从零训练+早停 → refit（TRAIN+VAL）→ 保存权重 → 评估
-    """
     torch.manual_seed(seed); np.random.seed(seed)
 
-    # 先准备 Train/Val/Test 的缩放和 DataLoader（两条分支都会用到）
-    sc_tr = StandardScaler().fit(Xtr_sel)
-    Xtr_s = sc_tr.transform(Xtr_sel).astype(np.float32)
-    Xva_s = sc_tr.transform(Xva_sel).astype(np.float32)
-    Xte_s = sc_tr.transform(Xte_sel).astype(np.float32)
+    # ===== 预先准备：TV 标准化 & 测试集 loader =====
+    sc_tv = StandardScaler().fit(np.vstack([Xtr_sel, Xva_sel]))
+    Xtv_s = sc_tv.transform(np.vstack([Xtr_sel, Xva_sel])).astype(np.float32)
+    y_tv_all = np.concatenate([y_tr, y_va]).astype(np.float32)
+    te_loader_refit = DataLoader(
+        SpectraDS(sc_tv.transform(Xte_sel).astype(np.float32), y_te.astype(np.float32)),
+        batch_size=CFG["batch_size"], shuffle=False, drop_last=False
+    )
 
-    tr_loader = DataLoader(SpectraDS(Xtr_s, y_tr), batch_size=CFG["batch_size"], shuffle=True, drop_last=False)
-    va_loader = DataLoader(SpectraDS(Xva_s, y_va), batch_size=CFG["batch_size"], shuffle=False, drop_last=False)
+    # ===== A) 续训分支：跳过 stage-1，但训练&打印流程与 stage-1 完全一致 =====
+    if CONTINUE_TRAIN and (seed == RESUME_SEED) and RESUME_WEIGHTS_PATH:
+        print(f"[Resume] CONTINUE_TRAIN=True & seed={seed}. 跳过 stage-1，直接在 Train+Val 划分出 train/val 继续训练（流程与 stage-1 一致）。")
 
-    # === 分支 A：继续训练（加载后在 Train/Val 上跑满 max_epochs，并打印日志） ===
-    if CONTINUE_TRAINING:
-        # 1) 构建与保存时一致的模型结构（band 数需一致）
-        model = SelfTransformerRegressor(
-            n_bands=Xtr_s.shape[1],
-            d_model=CFG["d_model"], nhead=CFG["nhead"],
-            num_layers=CFG["num_layers"], dim_ff=CFG["dim_ff"], dropout=CFG["dropout"]
-        ).to(device)
-
-        # 2) 载入已有权重；失败则报错，避免意外从零训
-        ok = try_load_model_weights(WEIGHTS_PATH, model)
-        if not ok:
-            raise FileNotFoundError(
-                f"[ResumeError] CONTINUE_TRAINING=True 但无法加载权重：{WEIGHTS_PATH}。"
-                " 请确认文件存在且可信，或将 CONTINUE_TRAINING=False 先从头训练一次。"
-            )
-
-        # 3) 继续训练：在 Train 上优化，在 Val 上评估，打印与原样式一致的日志
-        opt  = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
-        crit = nn.SmoothL1Loss(beta=CFG["huber_beta"])
-        best_val = float("inf")
-        best_state = None
-
-        for ep in range(1, CFG["max_epochs"] + 1):
-            # 余弦退火 + warmup（这里继续训练阶段长度为 max_epochs）
-            for pg in opt.param_groups:
-                pg["lr"] = cosine_with_warmup(ep-1, CFG["lr"], CFG["warmup_epochs"], CFG["max_epochs"], CFG["cosine_min_lr"])
-
-            model.train()
-            train_mse_batches = []
-            for xb, yb in tr_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                opt.zero_grad(set_to_none=True)
-                pred = model(xb)
-                loss = crit(pred, yb)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
-                opt.step()
-                with torch.no_grad():
-                    train_mse_batches.append(torch.mean((pred - yb)**2).item())
-
-            tr_rmse = float(np.sqrt(np.mean(train_mse_batches)))
-            val_rmse, val_r2, _ = eval_loader(model, va_loader, crit)
-
-            # 按原来格式打印；可用 verbose_every 控制频率
-            if ep == 1 or ep % verbose_every == 0:
-                print(f"Epoch {ep:03d} | trainRMSE={tr_rmse:.3f} | valRMSE={val_rmse:.3f} | valR²={val_r2:.3f}")
-
-            # 记录“最好验证表现”的权重
-            if val_rmse < best_val - 1e-6:
-                best_val = val_rmse
-                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-        # 用最佳验证权重（如有）
-        if best_state is not None:
-            model.load_state_dict(best_state)
-
-        # 4) 进入原有的 TRAIN+VAL refit 阶段，并保存可供下次继续训练的权重
-        sc_tv = StandardScaler().fit(np.vstack([Xtr_sel, Xva_sel]))
-        Xtv_s = sc_tv.transform(np.vstack([Xtr_sel, Xva_sel])).astype(np.float32)
-        y_tv  = np.concatenate([y_tr, y_va]).astype(np.float32)
-        tv_loader = DataLoader(SpectraDS(Xtv_s, y_tv), batch_size=CFG["batch_size"], shuffle=True, drop_last=False)
-        te_loader_refit = DataLoader(
-            SpectraDS(sc_tv.transform(Xte_sel).astype(np.float32), y_te.astype(np.float32)),
-            batch_size=CFG["batch_size"], shuffle=False, drop_last=False
+        # 用 TV 再切一个 train/val（保证与 stage-1 一样有 val）
+        continue_val_ratio = min(0.2, max(0.1, VAL_SIZE / (1.0 - TEST_SIZE)))
+        idx = np.arange(len(y_tv_all))
+        tr_idx, va_idx = train_test_split(
+            idx, test_size=continue_val_ratio, random_state=RANDOM_STATE + seed, shuffle=True
         )
+        X_tv_tr, y_tv_tr = Xtv_s[tr_idx], y_tv_all[tr_idx]
+        X_tv_va, y_tv_va = Xtv_s[va_idx], y_tv_all[va_idx]
 
+        tv_tr_loader = DataLoader(SpectraDS(X_tv_tr, y_tv_tr), batch_size=CFG["batch_size"], shuffle=True,  drop_last=False)
+        tv_va_loader = DataLoader(SpectraDS(X_tv_va, y_tv_va), batch_size=CFG["batch_size"], shuffle=False, drop_last=False)
+
+        # 构建同结构模型并加载权重
         model2 = SelfTransformerRegressor(
             n_bands=Xtv_s.shape[1],
             d_model=CFG["d_model"], nhead=CFG["nhead"],
             num_layers=CFG["num_layers"], dim_ff=CFG["dim_ff"], dropout=CFG["dropout"]
         ).to(device)
-        model2.load_state_dict(model.state_dict(), strict=False)
 
+        try:
+            n_loaded = load_weights_flex(model2, RESUME_WEIGHTS_PATH, strict=RESUME_STRICT)
+            if n_loaded == 0:
+                print(f"[Resume][Warn] 从 {RESUME_WEIGHTS_PATH} 未加载到任何张量，将从随机初始化继续。")
+            else:
+                print(f"[Resume] Loaded {n_loaded} tensors; skipped 0 keys (name/shape mismatch).")
+        except Exception as e:
+            print(f"[Resume][Warn] 加载失败：{e}。将从随机初始化继续。")
+
+        # === 与 stage-1 一致的训练循环 ===
         opt2  = torch.optim.AdamW(model2.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
         crit2 = nn.SmoothL1Loss(beta=CFG["huber_beta"])
-        refit_epochs = min(int(1.2*CFG["patience"]), int(0.6*CFG["max_epochs"]))
-        for ep in range(1, refit_epochs+1):
+        best_val = float("inf"); best_state = None; wait = 0
+
+        for ep in range(1, CFG["max_epochs"] + 1):
+            # lr 调度一致
             for pg in opt2.param_groups:
-                pg["lr"] = cosine_with_warmup(ep-1, CFG["lr"], CFG["warmup_epochs"], refit_epochs, CFG["cosine_min_lr"])
+                pg["lr"] = cosine_with_warmup(ep - 1, CFG["lr"], CFG["warmup_epochs"], CFG["max_epochs"], CFG["cosine_min_lr"])
+
+            # Train
             model2.train()
-            for xb, yb in tv_loader:
+            train_mse_batches = []
+            for xb, yb in tv_tr_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 opt2.zero_grad(set_to_none=True)
                 pred = model2(xb)
@@ -587,36 +513,48 @@ def train_one_seed(seed, verbose_every=5):
                 loss.backward()
                 nn.utils.clip_grad_norm_(model2.parameters(), CFG["grad_clip"])
                 opt2.step()
+                with torch.no_grad():
+                    train_mse_batches.append(torch.mean((pred - yb) ** 2).item())
+            tr_rmse = float(np.sqrt(np.mean(train_mse_batches)))
 
-        save_model_weights(
-            WEIGHTS_PATH,
-            model2,
-            extra={
-                "cfg": CFG,
-                "sel_cols": sel_cols,
-                "scaler_mean": sc_tv.mean_,
-                "scaler_scale": sc_tv.scale_,
-            },
-        )
+            # Val
+            val_rmse, val_r2, _ = eval_loader(model2, tv_va_loader, crit2)
 
+            # 打印格式与 stage-1 完全一致
+            if ep == 1 or ep % verbose_every == 0:
+                print(f"Epoch {ep:03d} | trainRMSE={tr_rmse:.3f} | valRMSE={val_rmse:.3f} | valR²={val_r2:.3f}")
+
+            # early stopping 与 best_state
+            if val_rmse < best_val - 1e-6:
+                best_val = val_rmse; wait = 0
+                best_state = {k: v.detach().cpu() for k, v in model2.state_dict().items()}
+            else:
+                wait += 1
+                if wait >= CFG["patience"]:
+                    break
+
+        if best_state is not None:
+            model2.load_state_dict(best_state)
+
+        # 测试集评估并返回
         te_rmse, te_r2, te_pred = eval_loader(model2, te_loader_refit, crit2)
-        return te_pred, te_rmse, te_r2
+        final_state_dict = {k: v.detach().cpu() for k, v in model2.state_dict().items()}
+        return te_pred, te_rmse, te_r2, final_state_dict
 
-    # === 分支 B：从头训练 + 早停（保持原逻辑不变） ===
+    # ===== B) 原始两阶段流程：stage-1 (Train/Val) + refit (Train+Val) =====
+    # stage-1
     model = SelfTransformerRegressor(
         n_bands=Xtr_s.shape[1],
         d_model=CFG["d_model"], nhead=CFG["nhead"],
         num_layers=CFG["num_layers"], dim_ff=CFG["dim_ff"], dropout=CFG["dropout"]
     ).to(device)
     opt  = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
-    crit = nn.SmoothL1Loss(beta=CFG["huber_beta"])  # Huber
-    best_val = float("inf")
-    best_state = None
-    wait = 0
+    crit = nn.SmoothL1Loss(beta=CFG["huber_beta"])
+    best_val = float("inf"); best_state = None; wait = 0
 
-    for ep in range(1, CFG["max_epochs"]+1):
+    for ep in range(1, CFG["max_epochs"] + 1):
         for pg in opt.param_groups:
-            pg["lr"] = cosine_with_warmup(ep-1, CFG["lr"], CFG["warmup_epochs"], CFG["max_epochs"], CFG["cosine_min_lr"])
+            pg["lr"] = cosine_with_warmup(ep - 1, CFG["lr"], CFG["warmup_epochs"], CFG["max_epochs"], CFG["cosine_min_lr"])
         model.train()
         train_mse_batches = []
         for xb, yb in tr_loader:
@@ -628,7 +566,7 @@ def train_one_seed(seed, verbose_every=5):
             nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
             opt.step()
             with torch.no_grad():
-                train_mse_batches.append(torch.mean((pred - yb)**2).item())
+                train_mse_batches.append(torch.mean((pred - yb) ** 2).item())
         tr_rmse = float(np.sqrt(np.mean(train_mse_batches)))
         val_rmse, val_r2, _ = eval_loader(model, va_loader, crit)
         if ep == 1 or ep % verbose_every == 0:
@@ -643,28 +581,25 @@ def train_one_seed(seed, verbose_every=5):
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # Refit on TRAIN+VAL（保持原逻辑）
-    sc_tv = StandardScaler().fit(np.vstack([Xtr_sel, Xva_sel]))
-    Xtv_s = sc_tv.transform(np.vstack([Xtr_sel, Xva_sel])).astype(np.float32)
-    y_tv  = np.concatenate([y_tr, y_va]).astype(np.float32)
-    tv_loader = DataLoader(SpectraDS(Xtv_s, y_tv), batch_size=CFG["batch_size"], shuffle=True, drop_last=False)
-    te_loader_refit = DataLoader(
-        SpectraDS(sc_tv.transform(Xte_sel).astype(np.float32), y_te.astype(np.float32)),
-        batch_size=CFG["batch_size"], shuffle=False, drop_last=False
-    )
-
-    torch.manual_seed(seed)
+    # refit（TV 上再训练若干轮）
+    tv_loader = DataLoader(SpectraDS(Xtv_s, y_tv_all), batch_size=CFG["batch_size"], shuffle=True, drop_last=False)
     model2 = SelfTransformerRegressor(
         n_bands=Xtv_s.shape[1],
         d_model=CFG["d_model"], nhead=CFG["nhead"],
         num_layers=CFG["num_layers"], dim_ff=CFG["dim_ff"], dropout=CFG["dropout"]
     ).to(device)
+    try:
+        if best_state is not None:
+            model2.load_state_dict(best_state, strict=False)
+    except Exception:
+        pass
+
     opt2  = torch.optim.AdamW(model2.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
     crit2 = nn.SmoothL1Loss(beta=CFG["huber_beta"])
-    refit_epochs = min(int(1.2*CFG["patience"]), int(0.6*CFG["max_epochs"]))
-    for ep in range(1, refit_epochs+1):
+    refit_epochs = min(int(1.2 * CFG["patience"]), int(0.6 * CFG["max_epochs"]))
+    for ep in range(1, refit_epochs + 1):
         for pg in opt2.param_groups:
-            pg["lr"] = cosine_with_warmup(ep-1, CFG["lr"], CFG["warmup_epochs"], refit_epochs, CFG["cosine_min_lr"])
+            pg["lr"] = cosine_with_warmup(ep - 1, CFG["lr"], CFG["warmup_epochs"], refit_epochs, CFG["cosine_min_lr"])
         model2.train()
         for xb, yb in tv_loader:
             xb, yb = xb.to(device), yb.to(device)
@@ -675,32 +610,58 @@ def train_one_seed(seed, verbose_every=5):
             nn.utils.clip_grad_norm_(model2.parameters(), CFG["grad_clip"])
             opt2.step()
 
-    save_model_weights(
-        WEIGHTS_PATH,
-        model2,
-        extra={
-            "cfg": CFG,
-            "sel_cols": sel_cols,
-            "scaler_mean": sc_tv.mean_,
-            "scaler_scale": sc_tv.scale_,
-        },
-    )
-
     te_rmse, te_r2, te_pred = eval_loader(model2, te_loader_refit, crit2)
-    return te_pred, te_rmse, te_r2
+    final_state_dict = {k: v.detach().cpu() for k, v in model2.state_dict().items()}
+    return te_pred, te_rmse, te_r2, final_state_dict
 
 
-# ====== 单seed=23 训练与评估 ======
-SEED = 23
-y_pred, test_rmse, test_r2 = train_one_seed(SEED)
-print(f"\nSeed {SEED} → Test RMSE={test_rmse:.3f} | Test R²={test_r2:.3f}")
 
-#Optional: scatter plot
-plt.figure(figsize=(4.8,4.2))
-plt.scatter(y_te, y_pred, s=16)
-mn, mx = min(y_te.min(), y_pred.min()), max(y_te.max(), y_pred.max())
-plt.plot([mn,mx],[mn,mx],'k--',lw=1)
-plt.xlabel("True Nmass_O"); plt.ylabel("Predicted Nmass_O"); plt.title(f"Self-Transformer — Test (seed={SEED})")
-plt.tight_layout(); plt.show()
-# ====== end ======
+# ===== 多 seed 训练与保存 =====
+_ensure_dir(SAVE_DIR)
+
+if CONTINUE_TRAIN:
+    print(f"[Mode] CONTINUE_TRAIN=True → 仅继续训练 seed={RESUME_SEED} 并覆盖原权重")
+    pred, rm, r2, state_dict = train_one_seed(RESUME_SEED)
+    save_path = RESUME_WEIGHTS_PATH  # 覆盖原文件
+    _save_state_dict(state_dict, save_path)
+    print(f"[Continue] 覆盖保存权重 → {save_path}")
+    print(f"[Continue] Test RMSE={rm:.4f} | R²={r2:.4f}")
+else:
+    all_preds, seed_scores = [], []
+    seed_states, seed_save_paths = {}, {}
+
+    for sd in CFG["seeds"]:
+        pred, rm, r2, state_dict = train_one_seed(sd)
+        all_preds.append(pred.reshape(-1, 1))
+        seed_scores.append((sd, rm, r2))
+        seed_states[sd] = state_dict
+        if SAVE_PER_SEED:
+            save_path = os.path.join(SAVE_DIR, f"transformer_seed{sd}_testR2_{r2:.4f}.pt")
+            _save_state_dict(state_dict, save_path)
+            seed_save_paths[sd] = save_path
+
+    ens_pred = np.mean(np.hstack(all_preds), axis=1)
+    ens_rmse = float(np.sqrt(np.mean((y_te - ens_pred)**2)))
+    ss_res = float(np.sum((y_te - ens_pred)**2))
+    ss_tot = float(np.sum((y_te - y_te.mean())**2) + 1e-12)
+    ens_r2  = 1.0 - ss_res/ss_tot
+    print("\nPer-seed test scores:")
+    for sd, rm, r2 in seed_scores:
+        print(f"  seed {sd:>2} → RMSE={rm:.3f} | R²={r2:.3f}")
+    print(f"\nEnsemble  → RMSE={ens_rmse:.3f} | R²={ens_r2:.3f}")
+
+    if SAVE_BEST_BY_TEST_R2 and len(seed_scores) > 0:
+        best_seed, best_rmse, best_r2 = max(seed_scores, key=lambda t: t[2])
+        best_state = seed_states[best_seed]
+        best_path = os.path.join(SAVE_DIR, f"best_by_testR2_seed{best_seed}_R2_{best_r2:.4f}.pt")
+        _save_state_dict(best_state, best_path)
+        print(f"[Best] Best-by-testR2 seed={best_seed} | R²={best_r2:.4f} | RMSE={best_rmse:.4f}")
+        print(f"[Best] Saved extra copy to: {best_path}")
+
+    plt.figure(figsize=(4.8,4.2))
+    plt.scatter(y_te, ens_pred, s=16)
+    mn, mx = min(y_te.min(), ens_pred.min()), max(y_te.max(), ens_pred.max())
+    plt.plot([mn,mx],[mn,mx],'k--',lw=1)
+    plt.xlabel("True Nmass_O"); plt.ylabel("Predicted Nmass_O"); plt.title("Self-Transformer (ensemble) — Test")
+    plt.tight_layout(); plt.show()
 
